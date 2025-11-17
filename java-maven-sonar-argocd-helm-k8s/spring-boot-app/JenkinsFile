@@ -1,18 +1,24 @@
 pipeline {
   agent {
     docker {
-      image 'shreyasgrandhe/maven-jenkins-agent:v1' // must include docker CLI and git
+      image 'shreyasgrandhe/maven-jenkins-agent:v1' // must include docker CLI, git, maven, java
       args '--user root -v /var/run/docker.sock:/var/run/docker.sock'
     }
   }
+
+  environment {
+    SONAR_URL = "http://65.1.136.198:9000"
+    GIT_USER_NAME = "iam-veeramalla"
+    GIT_REPO_NAME = "Jenkins-Zero-To-Hero"
+    // DOCKER_IMAGE will be set in the stage using BUILD_NUMBER
+  }
+
   stages {
     stage('Checkout') {
       steps {
-        // actually checkout the repo
-        checkout([$class: 'GitSCM',
-          branches: [[name: '*/main']],
-          userRemoteConfigs: [[url: 'https://github.com/iam-veeramalla/Jenkins-Zero-To-Hero.git']]
-        ])
+        // If this Jenkinsfile is checked out from the same repo, checkout scm will work.
+        // Otherwise replace with an explicit checkout of your repo.
+        checkout scm
       }
     }
 
@@ -23,6 +29,7 @@ pipeline {
           echo "== java =="; java -version || true
           echo "== mvn =="; mvn -version || true
           echo "== docker =="; docker --version || true
+          echo "== git =="; git --version || true
           echo "== pwd & ls =="
           pwd
           ls -la
@@ -32,18 +39,19 @@ pipeline {
 
     stage('Build and Test') {
       steps {
-        sh 'ls -ltr'
-        sh 'cd java-maven-sonar-argocd-helm-k8s/spring-boot-app && mvn clean package'
+        sh '''
+          set -e
+          cd java-maven-sonar-argocd-helm-k8s/spring-boot-app
+          mvn clean package
+        '''
       }
     }
 
     stage('Static Code Analysis') {
-      environment {
-        SONAR_URL = "http://65.1.136.198:9000"
-      }
       steps {
         withCredentials([string(credentialsId: 'sonarqube', variable: 'SONAR_AUTH_TOKEN')]) {
           sh '''
+            set -e
             cd java-maven-sonar-argocd-helm-k8s/spring-boot-app
             mvn sonar:sonar -Dsonar.login=$SONAR_AUTH_TOKEN -Dsonar.host.url=${SONAR_URL}
           '''
@@ -57,36 +65,78 @@ pipeline {
       }
       steps {
         script {
-          // build
-          sh 'cd java-maven-sonar-argocd-helm-k8s/spring-boot-app && docker build -t ${DOCKER_IMAGE} .'
+          sh '''
+            set -e
+            cd java-maven-sonar-argocd-helm-k8s/spring-boot-app
+            docker build -t ${DOCKER_IMAGE} .
+          '''
           def dockerImage = docker.image("${DOCKER_IMAGE}")
-          // push using docker plugin credentials id (docker-cred)
           docker.withRegistry('https://index.docker.io/v1/', 'docker-cred') {
             dockerImage.push()
-            // optionally push 'latest': dockerImage.push('latest')
+            // optional: dockerImage.push('latest')
           }
         }
       }
     }
 
     stage('Update Deployment File') {
-      environment {
-        GIT_REPO_NAME = "Jenkins-Zero-To-Hero"
-        GIT_USER_NAME = "iam-veeramalla"
-      }
       steps {
         withCredentials([string(credentialsId: 'github', variable: 'GITHUB_TOKEN')]) {
           sh '''
+            set -e
+            # Make sure we're inside the git workspace (checkout scm above should have created .git).
+            if [ ! -d .git ]; then
+              echo ".git not found in current workspace. Cloning fresh repo..."
+              rm -rf repo
+              git clone https://${GITHUB_TOKEN}@github.com/${GIT_USER_NAME}/${GIT_REPO_NAME}.git repo
+              cd repo
+            else
+              # use workspace repo, ensure origin uses token for push
+              git remote set-url origin https://${GITHUB_TOKEN}@github.com/${GIT_USER_NAME}/${GIT_REPO_NAME}.git
+            fi
+
+            # print current path for debugging
+            pwd
+            ls -la
+
+            # ensure we are in repo root (if we cloned into repo, we already cd'd there)
+            if [ -d .git ]; then
+              echo "Using existing workspace git repo"
+            else
+              # if we earlier cloned to repo dir, we need to cd into it
+              if [ -d repo/.git ]; then
+                cd repo
+              fi
+            fi
+
             git config user.email "shreyas.xyz@gmail.com"
             git config user.name "Shreyas Grandhe"
-            BUILD_NUMBER=${BUILD_NUMBER}
+
+            # Replace placeholder tag in deployment manifest
             sed -i "s/replaceImageTag/${BUILD_NUMBER}/g" java-maven-sonar-argocd-helm-k8s/spring-boot-app-manifests/deployment.yml
+
+            # Add and commit (tolerate no changes)
             git add java-maven-sonar-argocd-helm-k8s/spring-boot-app-manifests/deployment.yml
             git commit -m "Update deployment image to version ${BUILD_NUMBER}" || echo "No changes to commit"
-            git push https://${GITHUB_TOKEN}@github.com/${GIT_USER_NAME}/${GIT_REPO_NAME} HEAD:main
+
+            # Push to main
+            git push origin HEAD:main
           '''
         }
       }
+    }
+  }
+
+  post {
+    always {
+      echo "Cleaning workspace"
+      cleanWs()
+    }
+    success {
+      echo "Pipeline finished successfully"
+    }
+    failure {
+      echo "Pipeline failed"
     }
   }
 }
