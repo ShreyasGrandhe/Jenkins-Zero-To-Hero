@@ -1,12 +1,8 @@
 pipeline {
   agent {
     docker {
-      image 'shreyasgrandhe/maven-jenkins-agent:v1' // must include docker CLI, git, maven, java
-      // Recommended: run container with same UID:GID as the Jenkins user to avoid ownership issues.
-      // Replace <JENKINS_UID>:<JENKINS_GID> with values from `id -u jenkins` and `id -g jenkins` on the host.
-      // Example: args '--user 1000:1000 -v /var/run/docker.sock:/var/run/docker.sock'
-      // If you can't change now, the pipeline includes a safe-directory workaround.
-      args '--user <JENKINS_UID>:<JENKINS_GID> -v /var/run/docker.sock:/var/run/docker.sock'
+      image 'shreyasgrandhe/maven-jenkins-agent:v1'
+      args '--user root -v /var/run/docker.sock:/var/run/docker.sock'
     }
   }
 
@@ -14,14 +10,12 @@ pipeline {
     SONAR_URL = "http://65.1.136.198:9000"
     GIT_USER_NAME = "iam-veeramalla"
     GIT_REPO_NAME = "Jenkins-Zero-To-Hero"
-    // DOCKER_IMAGE will be set in the stage using BUILD_NUMBER
   }
 
   stages {
+
     stage('Checkout') {
       steps {
-        // If this Jenkinsfile is stored in the same repo, checkout scm works well.
-        // Otherwise replace with an explicit checkout/clone of the repo.
         checkout scm
       }
     }
@@ -29,14 +23,11 @@ pipeline {
     stage('Verify environment') {
       steps {
         sh '''
-          echo "== whoami =="; whoami
-          echo "== java =="; java -version || true
-          echo "== mvn =="; mvn -version || true
-          echo "== docker =="; docker --version || true
-          echo "== git =="; git --version || true
-          echo "== pwd & ls =="
-          pwd
-          ls -la
+          whoami
+          java -version || true
+          mvn -version || true
+          docker --version || true
+          git --version || true
         '''
       }
     }
@@ -44,7 +35,6 @@ pipeline {
     stage('Build and Test') {
       steps {
         sh '''
-          set -e
           cd java-maven-sonar-argocd-helm-k8s/spring-boot-app
           mvn clean package
         '''
@@ -55,7 +45,6 @@ pipeline {
       steps {
         withCredentials([string(credentialsId: 'sonarqube', variable: 'SONAR_AUTH_TOKEN')]) {
           sh '''
-            set -e
             cd java-maven-sonar-argocd-helm-k8s/spring-boot-app
             mvn sonar:sonar -Dsonar.login=$SONAR_AUTH_TOKEN -Dsonar.host.url=${SONAR_URL}
           '''
@@ -70,14 +59,11 @@ pipeline {
       steps {
         script {
           sh '''
-            set -e
             cd java-maven-sonar-argocd-helm-k8s/spring-boot-app
             docker build -t ${DOCKER_IMAGE} .
           '''
-          def dockerImage = docker.image("${DOCKER_IMAGE}")
           docker.withRegistry('https://index.docker.io/v1/', 'docker-cred') {
-            dockerImage.push()
-            // optional: dockerImage.push('latest')
+            docker.image("${DOCKER_IMAGE}").push()
           }
         }
       }
@@ -89,39 +75,25 @@ pipeline {
           sh '''
             set -e
 
-            # <<< Immediate fix: mark current workspace safe for git to avoid "dubious ownership" errors >>>
-            git config --global --add safe.directory "$(pwd)" || true
+            # ❗DELETE any old repo clone
+            rm -rf update-repo
 
-            # If .git missing, clone a fresh repo; otherwise set remote to use token for push
-            if [ ! -d .git ]; then
-              echo ".git not found in current workspace. Cloning fresh repo..."
-              rm -rf repo
-              git clone https://${GITHUB_TOKEN}@github.com/${GIT_USER_NAME}/${GIT_REPO_NAME}.git repo
-              cd repo
-            else
-              git remote set-url origin https://${GITHUB_TOKEN}@github.com/${GIT_USER_NAME}/${GIT_REPO_NAME}.git
-            fi
+            # ❗ALWAYS CLONE THE REPO FRESH
+            git clone https://${GITHUB_TOKEN}@github.com/${GIT_USER_NAME}/${GIT_REPO_NAME}.git update-repo
 
-            # If we cloned into repo/, ensure we are in repo root
-            if [ -d repo/.git ] && [ ! -d .git ]; then
-              cd repo
-            fi
-
-            pwd
-            ls -la
+            cd update-repo
 
             git config user.email "shreyas.xyz@gmail.com"
             git config user.name "Shreyas Grandhe"
 
-            # Replace placeholder tag in deployment manifest
+            # Update deployment.yml
             sed -i "s/replaceImageTag/${BUILD_NUMBER}/g" java-maven-sonar-argocd-helm-k8s/spring-boot-app-manifests/deployment.yml
 
-            # Add and commit (tolerate no changes)
             git add java-maven-sonar-argocd-helm-k8s/spring-boot-app-manifests/deployment.yml
-            git commit -m "Update deployment image to version ${BUILD_NUMBER}" || echo "No changes to commit"
 
-            # Push changes
-            git push origin HEAD:main
+            git commit -m "Update deployment image to version ${BUILD_NUMBER}" || echo "No changes"
+
+            git push origin main
           '''
         }
       }
@@ -130,14 +102,7 @@ pipeline {
 
   post {
     always {
-      echo "Cleaning workspace"
       cleanWs()
-    }
-    success {
-      echo "Pipeline finished successfully"
-    }
-    failure {
-      echo "Pipeline failed"
     }
   }
 }
