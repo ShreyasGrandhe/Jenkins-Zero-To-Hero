@@ -2,7 +2,11 @@ pipeline {
   agent {
     docker {
       image 'shreyasgrandhe/maven-jenkins-agent:v1' // must include docker CLI, git, maven, java
-      args '--user root -v /var/run/docker.sock:/var/run/docker.sock'
+      // Recommended: run container with same UID:GID as the Jenkins user to avoid ownership issues.
+      // Replace <JENKINS_UID>:<JENKINS_GID> with values from `id -u jenkins` and `id -g jenkins` on the host.
+      // Example: args '--user 1000:1000 -v /var/run/docker.sock:/var/run/docker.sock'
+      // If you can't change now, the pipeline includes a safe-directory workaround.
+      args '--user <JENKINS_UID>:<JENKINS_GID> -v /var/run/docker.sock:/var/run/docker.sock'
     }
   }
 
@@ -16,8 +20,8 @@ pipeline {
   stages {
     stage('Checkout') {
       steps {
-        // If this Jenkinsfile is checked out from the same repo, checkout scm will work.
-        // Otherwise replace with an explicit checkout of your repo.
+        // If this Jenkinsfile is stored in the same repo, checkout scm works well.
+        // Otherwise replace with an explicit checkout/clone of the repo.
         checkout scm
       }
     }
@@ -84,30 +88,27 @@ pipeline {
         withCredentials([string(credentialsId: 'github', variable: 'GITHUB_TOKEN')]) {
           sh '''
             set -e
-            # Make sure we're inside the git workspace (checkout scm above should have created .git).
+
+            # <<< Immediate fix: mark current workspace safe for git to avoid "dubious ownership" errors >>>
+            git config --global --add safe.directory "$(pwd)" || true
+
+            # If .git missing, clone a fresh repo; otherwise set remote to use token for push
             if [ ! -d .git ]; then
               echo ".git not found in current workspace. Cloning fresh repo..."
               rm -rf repo
               git clone https://${GITHUB_TOKEN}@github.com/${GIT_USER_NAME}/${GIT_REPO_NAME}.git repo
               cd repo
             else
-              # use workspace repo, ensure origin uses token for push
               git remote set-url origin https://${GITHUB_TOKEN}@github.com/${GIT_USER_NAME}/${GIT_REPO_NAME}.git
             fi
 
-            # print current path for debugging
+            # If we cloned into repo/, ensure we are in repo root
+            if [ -d repo/.git ] && [ ! -d .git ]; then
+              cd repo
+            fi
+
             pwd
             ls -la
-
-            # ensure we are in repo root (if we cloned into repo, we already cd'd there)
-            if [ -d .git ]; then
-              echo "Using existing workspace git repo"
-            else
-              # if we earlier cloned to repo dir, we need to cd into it
-              if [ -d repo/.git ]; then
-                cd repo
-              fi
-            fi
 
             git config user.email "shreyas.xyz@gmail.com"
             git config user.name "Shreyas Grandhe"
@@ -119,7 +120,7 @@ pipeline {
             git add java-maven-sonar-argocd-helm-k8s/spring-boot-app-manifests/deployment.yml
             git commit -m "Update deployment image to version ${BUILD_NUMBER}" || echo "No changes to commit"
 
-            # Push to main
+            # Push changes
             git push origin HEAD:main
           '''
         }
